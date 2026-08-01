@@ -1,11 +1,3 @@
-"""
-Michigan Senate Democratic Primary (El-Sayed vs Stevens)
-Live election-night Bayesian county-level model
-
-Scalable framework for real-time margin projection with credibility-weighted
-statewide shift detection and outlier dampening.
-"""
-
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -14,13 +6,7 @@ from typing import Dict, Tuple, List
 import json
 
 
-# ============================================================================
-# BASELINE DATA SETUP
-# ============================================================================
-
-# Michigan regional structure (geographic + demographic clustering)
 COUNTY_REGIONS = {
-    # Detroit Metro (Southeast) - urban/diverse
     'Wayne': 'Detroit_Metro',
     'Oakland': 'Detroit_Metro',
     'Macomb': 'Detroit_Metro',
@@ -30,7 +16,6 @@ COUNTY_REGIONS = {
     'Jackson': 'Detroit_Metro',
     'Hillsdale': 'Detroit_Metro',
     
-    # Mid-Michigan (Central) - mixed urban/rural, Lansing area
     'Ingham': 'Mid_Michigan',
     'Eaton': 'Mid_Michigan',
     'Clinton': 'Mid_Michigan',
@@ -40,7 +25,6 @@ COUNTY_REGIONS = {
     'Gratiot': 'Mid_Michigan',
     'Bay': 'Mid_Michigan',
     
-    # West Michigan - Grand Rapids area, coast
     'Kent': 'West_Michigan',
     'Ottawa': 'West_Michigan',
     'Allegan': 'West_Michigan',
@@ -57,13 +41,11 @@ COUNTY_REGIONS = {
     'Branch': 'West_Michigan',
     'Mecosta': 'West_Michigan',
     
-    # Thumb Region - rural agricultural
     'Tuscola': 'Thumb',
     'Huron': 'Thumb',
     'Sanilac': 'Thumb',
     'Lapeer': 'Thumb',
     
-    # Northern Lower Peninsula - rural/small towns, resort areas
     'Grand Traverse': 'North_Lower',
     'Leelanau': 'North_Lower',
     'Charlevoix': 'North_Lower',
@@ -90,7 +72,6 @@ COUNTY_REGIONS = {
     'Alcona': 'North_Lower',
     'Montmorency': 'North_Lower',
     
-    # Upper Peninsula - rural, mining heritage
     'Marquette': 'Upper_Peninsula',
     'Houghton': 'Upper_Peninsula',
     'Delta': 'Upper_Peninsula',
