@@ -1,3 +1,11 @@
+"""
+Michigan Senate Democratic Primary (El-Sayed vs Stevens)
+Live election-night Bayesian county-level model
+
+Scalable framework for real-time margin projection with credibility-weighted
+statewide shift detection and outlier dampening.
+"""
+
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -6,7 +14,13 @@ from typing import Dict, Tuple, List
 import json
 
 
+# ============================================================================
+# BASELINE DATA SETUP
+# ============================================================================
+
+# Michigan regional structure (geographic + demographic clustering)
 COUNTY_REGIONS = {
+    # Detroit Metro (Southeast) - urban/diverse
     'Wayne': 'Detroit_Metro',
     'Oakland': 'Detroit_Metro',
     'Macomb': 'Detroit_Metro',
@@ -16,6 +30,7 @@ COUNTY_REGIONS = {
     'Jackson': 'Detroit_Metro',
     'Hillsdale': 'Detroit_Metro',
     
+    # Mid-Michigan (Central) - mixed urban/rural, Lansing area
     'Ingham': 'Mid_Michigan',
     'Eaton': 'Mid_Michigan',
     'Clinton': 'Mid_Michigan',
@@ -25,6 +40,7 @@ COUNTY_REGIONS = {
     'Gratiot': 'Mid_Michigan',
     'Bay': 'Mid_Michigan',
     
+    # West Michigan - Grand Rapids area, coast
     'Kent': 'West_Michigan',
     'Ottawa': 'West_Michigan',
     'Allegan': 'West_Michigan',
@@ -41,11 +57,13 @@ COUNTY_REGIONS = {
     'Branch': 'West_Michigan',
     'Mecosta': 'West_Michigan',
     
+    # Thumb Region - rural agricultural
     'Tuscola': 'Thumb',
     'Huron': 'Thumb',
     'Sanilac': 'Thumb',
     'Lapeer': 'Thumb',
     
+    # Northern Lower Peninsula - rural/small towns, resort areas
     'Grand Traverse': 'North_Lower',
     'Leelanau': 'North_Lower',
     'Charlevoix': 'North_Lower',
@@ -72,6 +90,7 @@ COUNTY_REGIONS = {
     'Alcona': 'North_Lower',
     'Montmorency': 'North_Lower',
     
+    # Upper Peninsula - rural, mining heritage
     'Marquette': 'Upper_Peninsula',
     'Houghton': 'Upper_Peninsula',
     'Delta': 'Upper_Peninsula',
@@ -193,8 +212,8 @@ BASELINE_TURNOUT = {
     for county, votes in SLOTKIN_HARPER_TURNOUT.items()
 }
 
-# Fixed third-candidate vote share
-MCMORROW_SHARE = 0.02
+# McMorrow vote share will be calculated dynamically from observed votes
+# (no longer hardcoded)
 
 # Model hyperparameters
 @dataclass
@@ -246,17 +265,14 @@ class BaselineProjection:
             votes = self.turnout[county]
             
             # Convert margin to vote shares
-            # If El-Sayed margin is +8, El-Sayed gets 54%, Stevens 44%, McMorrow 2%
+            # If El-Sayed margin is +8, El-Sayed gets 54%, Stevens 44%
+            # McMorrow share will be calculated from observed votes dynamically
             el_sayed_share = (margin + 100) / 2 / 100
             stevens_share = (100 - margin) / 2 / 100
             
-            # Allocate McMorrow first
-            mcmorrow_votes = int(votes * MCMORROW_SHARE)
-            remaining_votes = votes - mcmorrow_votes
-            
-            # Split remaining between El-Sayed and Stevens
-            el_sayed_votes = int(remaining_votes * el_sayed_share)
-            stevens_votes = remaining_votes - el_sayed_votes
+            # Project El-Sayed vs Stevens (McMorrow calculated from observed data)
+            el_sayed_votes = int(votes * el_sayed_share)
+            stevens_votes = int(votes * stevens_share)
             
             counties.append({
                 'county': county,
@@ -264,28 +280,24 @@ class BaselineProjection:
                 'total_votes': votes,
                 'el_sayed_baseline': el_sayed_votes,
                 'stevens_baseline': stevens_votes,
-                'mcmorrow_baseline': mcmorrow_votes,
             })
         
         return pd.DataFrame(counties)
     
     def get_statewide_baseline(self) -> Dict[str, float]:
-        """Calculate statewide baseline"""
+        """Calculate statewide baseline (El-Sayed vs Stevens only)"""
         total_el_sayed = self.projection['el_sayed_baseline'].sum()
         total_stevens = self.projection['stevens_baseline'].sum()
-        total_mcmorrow = self.projection['mcmorrow_baseline'].sum()
-        total_votes = total_el_sayed + total_stevens + total_mcmorrow
+        total_votes = total_el_sayed + total_stevens
         
-        margin = (total_el_sayed - total_stevens) / (total_el_sayed + total_stevens) * 100
+        margin = (total_el_sayed - total_stevens) / total_votes * 100
         
         return {
             'el_sayed': total_el_sayed,
             'stevens': total_stevens,
-            'mcmorrow': total_mcmorrow,
             'total': total_votes,
             'el_sayed_pct': total_el_sayed / total_votes,
             'stevens_pct': total_stevens / total_votes,
-            'mcmorrow_pct': total_mcmorrow / total_votes,
             'margin': margin
         }
 
@@ -590,7 +602,7 @@ class CountyProjector:
         self.config = config or ModelConfig()
         self.momentum = MomentumConstrainer(self.config)
     
-    def project_county(self, county: str, statewide_shift_estimate: Dict) -> Dict:
+    def project_county(self, county: str, statewide_shift_estimate: Dict, mcmorrow_share: float = None) -> Dict:
         """
         Project county margin and votes given statewide shift.
         
@@ -644,11 +656,13 @@ class CountyProjector:
         # Recalculate votes based on final adjusted margin
         votes = self.baseline.turnout[county]
         
+        # Use observed McMorrow share (default 0 if no observed data)
+        observed_mcmorrow = mcmorrow_share or 0.0
+        mcmorrow_votes = int(votes * observed_mcmorrow)
+        remaining_votes = votes - mcmorrow_votes
+        
         el_sayed_share = (adjusted_margin + 100) / 2 / 100
         stevens_share = (100 - adjusted_margin) / 2 / 100
-        
-        mcmorrow_votes = int(votes * MCMORROW_SHARE)
-        remaining_votes = votes - mcmorrow_votes
         
         el_sayed_votes = int(remaining_votes * el_sayed_share)
         stevens_votes = remaining_votes - el_sayed_votes
@@ -670,13 +684,34 @@ class CountyProjector:
     
     def project_all_counties(self, statewide_shift_estimate: Dict) -> pd.DataFrame:
         """Project all counties given statewide shift"""
+        
+        # Calculate observed McMorrow share from reported votes
+        mcmorrow_share = self._calculate_mcmorrow_share()
+        
         projections = []
         
         for county in self.baseline.baselines.keys():
-            proj = self.project_county(county, statewide_shift_estimate)
+            proj = self.project_county(county, statewide_shift_estimate, mcmorrow_share)
             projections.append(proj)
         
         return pd.DataFrame(projections)
+    
+    def _calculate_mcmorrow_share(self) -> float:
+        """Calculate McMorrow's observed share from reported votes"""
+        if not self.vote_aggregator or not self.vote_aggregator.observed_votes:
+            return 0.0
+        
+        total_mcmorrow = 0
+        total_votes = 0
+        
+        for votes_data in self.vote_aggregator.observed_votes.values():
+            total_mcmorrow += votes_data.get('mcmorrow', 0)
+            total_votes += votes_data['total']
+        
+        if total_votes == 0:
+            return 0.0
+        
+        return total_mcmorrow / total_votes
 
 
 # ============================================================================
@@ -696,6 +731,18 @@ class StatewideProjector:
         total_stevens = county_projections_df['stevens_projected'].sum()
         total_mcmorrow = county_projections_df['mcmorrow_projected'].sum()
         total_votes = total_el_sayed + total_stevens + total_mcmorrow
+        
+        if total_votes == 0:
+            return {
+                'el_sayed': 0,
+                'stevens': 0,
+                'mcmorrow': 0,
+                'total': 0,
+                'el_sayed_pct': 0.0,
+                'stevens_pct': 0.0,
+                'mcmorrow_pct': 0.0,
+                'margin': 0.0
+            }
         
         margin = (total_el_sayed - total_stevens) / (total_el_sayed + total_stevens) * 100
         
@@ -853,6 +900,10 @@ class MichiganSenateModel:
                     'el_sayed': projection['statewide_point']['el_sayed'],
                     'stevens': projection['statewide_point']['stevens'],
                     'mcmorrow': projection['statewide_point']['mcmorrow'],
+                    'total': projection['statewide_point']['total'],
+                    'el_sayed_pct': round(projection['statewide_point']['el_sayed_pct'], 4),
+                    'stevens_pct': round(projection['statewide_point']['stevens_pct'], 4),
+                    'mcmorrow_pct': round(projection['statewide_point']['mcmorrow_pct'], 4),
                     'margin': round(projection['statewide_point']['margin'], 2)
                 },
                 'confidence_intervals': {
