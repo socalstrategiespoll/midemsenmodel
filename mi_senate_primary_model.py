@@ -14,6 +14,19 @@ from typing import Dict, Tuple, List
 import json
 
 
+class NumpySafeEncoder(json.JSONEncoder):
+    """Handles numpy int64/float64 types that pandas produces, which the
+    standard json module can't serialize on its own."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
 # ============================================================================
 # BASELINE DATA SETUP
 # ============================================================================
@@ -212,8 +225,8 @@ BASELINE_TURNOUT = {
     for county, votes in SLOTKIN_HARPER_TURNOUT.items()
 }
 
-# McMorrow vote share will be calculated dynamically from observed votes
-# (no longer hardcoded)
+# Fixed third-candidate vote share
+MCMORROW_SHARE = 0.02
 
 # Model hyperparameters
 @dataclass
@@ -265,14 +278,17 @@ class BaselineProjection:
             votes = self.turnout[county]
             
             # Convert margin to vote shares
-            # If El-Sayed margin is +8, El-Sayed gets 54%, Stevens 44%
-            # McMorrow share will be calculated from observed votes dynamically
+            # If El-Sayed margin is +8, El-Sayed gets 54%, Stevens 44%, McMorrow 2%
             el_sayed_share = (margin + 100) / 2 / 100
             stevens_share = (100 - margin) / 2 / 100
             
-            # Project El-Sayed vs Stevens (McMorrow calculated from observed data)
-            el_sayed_votes = int(votes * el_sayed_share)
-            stevens_votes = int(votes * stevens_share)
+            # Allocate McMorrow first
+            mcmorrow_votes = int(votes * MCMORROW_SHARE)
+            remaining_votes = votes - mcmorrow_votes
+            
+            # Split remaining between El-Sayed and Stevens
+            el_sayed_votes = int(remaining_votes * el_sayed_share)
+            stevens_votes = remaining_votes - el_sayed_votes
             
             counties.append({
                 'county': county,
@@ -280,24 +296,28 @@ class BaselineProjection:
                 'total_votes': votes,
                 'el_sayed_baseline': el_sayed_votes,
                 'stevens_baseline': stevens_votes,
+                'mcmorrow_baseline': mcmorrow_votes,
             })
         
         return pd.DataFrame(counties)
     
     def get_statewide_baseline(self) -> Dict[str, float]:
-        """Calculate statewide baseline (El-Sayed vs Stevens only)"""
+        """Calculate statewide baseline"""
         total_el_sayed = self.projection['el_sayed_baseline'].sum()
         total_stevens = self.projection['stevens_baseline'].sum()
-        total_votes = total_el_sayed + total_stevens
+        total_mcmorrow = self.projection['mcmorrow_baseline'].sum()
+        total_votes = total_el_sayed + total_stevens + total_mcmorrow
         
-        margin = (total_el_sayed - total_stevens) / total_votes * 100
+        margin = (total_el_sayed - total_stevens) / (total_el_sayed + total_stevens) * 100
         
         return {
             'el_sayed': total_el_sayed,
             'stevens': total_stevens,
+            'mcmorrow': total_mcmorrow,
             'total': total_votes,
             'el_sayed_pct': total_el_sayed / total_votes,
             'stevens_pct': total_stevens / total_votes,
+            'mcmorrow_pct': total_mcmorrow / total_votes,
             'margin': margin
         }
 
@@ -399,7 +419,7 @@ class BayesianShiftEstimator:
         
         # Heterogeneity variance (tau^2)
         tau_sq = max(
-            (Q - (k - 1)) / (W - W2 / W),
+            (Q - (k - 1)) / (W - W2 / W) if k > 1 else 0,
             self.config.tau_floor ** 2  # Primary uncertainty buffer
         )
         tau = np.sqrt(tau_sq)
@@ -602,116 +622,59 @@ class CountyProjector:
         self.config = config or ModelConfig()
         self.momentum = MomentumConstrainer(self.config)
     
-    def project_county(self, county: str, statewide_shift_estimate: Dict, mcmorrow_share: float = None) -> Dict:
+    def project_county(self, county: str, statewide_shift_estimate: Dict = None) -> Dict:
         """
-        Project county margin and votes given statewide shift.
-        
-        Uses regional shift if available, otherwise falls back to global.
-        Low-confidence counties (sparse polling) move less from baseline and have wider CIs.
-        
-        Adjustment = baseline + (confidence_adjusted credibility_weighted_shift)
-        Credibility weight grows with data in and statewide shift confidence.
-        
-        If significant votes reported, applies momentum constraint:
-        final margin can't drift >10 points from observed.
+        Two states, no blending:
+        - No live data yet for this county -> use the prior baseline directly.
+        - Live data available -> use civicAPI's real reported numbers directly.
+
+        No remainder projection, no turnout adjustor. The county's number is
+        either the prior estimate or the real result, never a mix of the two.
         """
-        
-        # Get baseline confidence for this county
-        confidence = self.baseline.confidence.get(county, 1.0)
-        
-        # Determine which shift to use
+
         region = COUNTY_REGIONS.get(county)
-        regional_shifts = statewide_shift_estimate.get('regional_shifts', {})
-        
-        # Prefer regional shift if available, otherwise use global
-        if region and region in regional_shifts and regional_shifts[region]['n_counties'] > 0:
-            shift = regional_shifts[region]['shift']
-        else:
-            shift = statewide_shift_estimate['statewide_shift']
-        
-        credibility = statewide_shift_estimate['effective_weight'] ** self.config.credibility_exponent
-        
-        # Apply confidence adjustment: low-confidence counties move less from baseline
-        # High confidence (1.0): Full shift applied
-        # Medium confidence (0.6): 60% of shift applied
-        # Low confidence (0.25): 25% of shift applied
-        confidence_adjusted_shift = shift * confidence
-        
-        # Bayesian adjustment (confidence-modulated)
-        adjusted_margin = self.baseline.baselines[county] + (
-            confidence_adjusted_shift * credibility * self.config.adaptation_speed
-        )
-        
-        # Apply momentum constraint if we have observed votes for this county
-        momentum_info = {'constraint_active': False}
-        if self.vote_aggregator and county in self.vote_aggregator.observed_votes:
+        baseline_row = self.baseline.projection[self.baseline.projection['county'] == county].iloc[0]
+
+        has_live_data = self.vote_aggregator and county in self.vote_aggregator.observed_votes
+
+        if has_live_data:
             votes_data = self.vote_aggregator.observed_votes[county]
-            observed_margin = (votes_data['el_sayed'] - votes_data['stevens']) / (votes_data['el_sayed'] + votes_data['stevens']) * 100
-            pct_reported = votes_data['total'] / self.baseline.turnout[county]
-            
-            adjusted_margin, momentum_info = self.momentum.apply_constraint(
-                county, observed_margin, pct_reported, adjusted_margin
-            )
-        
-        # Recalculate votes based on final adjusted margin
-        votes = self.baseline.turnout[county]
-        
-        # Use observed McMorrow share (default 0 if no observed data)
-        observed_mcmorrow = mcmorrow_share or 0.0
-        mcmorrow_votes = int(votes * observed_mcmorrow)
-        remaining_votes = votes - mcmorrow_votes
-        
-        el_sayed_share = (adjusted_margin + 100) / 2 / 100
-        stevens_share = (100 - adjusted_margin) / 2 / 100
-        
-        el_sayed_votes = int(remaining_votes * el_sayed_share)
-        stevens_votes = remaining_votes - el_sayed_votes
-        
+            el_sayed_votes = votes_data['el_sayed']
+            stevens_votes = votes_data['stevens']
+            mcmorrow_votes = votes_data['mcmorrow']
+            source = 'live'
+        else:
+            el_sayed_votes = int(baseline_row['el_sayed_baseline'])
+            stevens_votes = int(baseline_row['stevens_baseline'])
+            mcmorrow_votes = int(baseline_row['mcmorrow_baseline'])
+            source = 'prior'
+
+        total_projected = el_sayed_votes + stevens_votes + mcmorrow_votes
+        margin = ((el_sayed_votes - stevens_votes) / (el_sayed_votes + stevens_votes) * 100
+                   if (el_sayed_votes + stevens_votes) > 0 else self.baseline.baselines[county])
+
         return {
             'county': county,
             'region': region,
             'baseline_margin': self.baseline.baselines[county],
-            'baseline_confidence': confidence,
-            'adjusted_margin': adjusted_margin,
-            'shift_applied': confidence_adjusted_shift * credibility,
-            'shift_source': 'regional' if region and region in regional_shifts and regional_shifts[region]['n_counties'] > 0 else 'statewide',
+            'source': source,
+            'adjusted_margin': margin,
             'el_sayed_projected': el_sayed_votes,
             'stevens_projected': stevens_votes,
             'mcmorrow_projected': mcmorrow_votes,
-            'total_projected': votes,
-            'momentum_constraint': momentum_info
+            'total_projected': total_projected,
         }
+
     
     def project_all_counties(self, statewide_shift_estimate: Dict) -> pd.DataFrame:
         """Project all counties given statewide shift"""
-        
-        # Calculate observed McMorrow share from reported votes
-        mcmorrow_share = self._calculate_mcmorrow_share()
-        
         projections = []
         
         for county in self.baseline.baselines.keys():
-            proj = self.project_county(county, statewide_shift_estimate, mcmorrow_share)
+            proj = self.project_county(county, statewide_shift_estimate)
             projections.append(proj)
         
         return pd.DataFrame(projections)
-    
-    def _calculate_mcmorrow_share(self) -> float:
-        """Calculate McMorrow's observed share from reported votes"""
-        if not self.vote_aggregator or not self.vote_aggregator.observed_votes:
-            return 0.0
-        
-        total_mcmorrow = 0
-        total_votes = 0
-        
-        for votes_data in self.vote_aggregator.observed_votes.values():
-            total_mcmorrow += votes_data.get('mcmorrow', 0)
-            total_votes += votes_data['total']
-        
-        if total_votes == 0:
-            return 0.0
-        
-        return total_mcmorrow / total_votes
 
 
 # ============================================================================
@@ -731,18 +694,6 @@ class StatewideProjector:
         total_stevens = county_projections_df['stevens_projected'].sum()
         total_mcmorrow = county_projections_df['mcmorrow_projected'].sum()
         total_votes = total_el_sayed + total_stevens + total_mcmorrow
-        
-        if total_votes == 0:
-            return {
-                'el_sayed': 0,
-                'stevens': 0,
-                'mcmorrow': 0,
-                'total': 0,
-                'el_sayed_pct': 0.0,
-                'stevens_pct': 0.0,
-                'mcmorrow_pct': 0.0,
-                'margin': 0.0
-            }
         
         margin = (total_el_sayed - total_stevens) / (total_el_sayed + total_stevens) * 100
         
@@ -900,10 +851,6 @@ class MichiganSenateModel:
                     'el_sayed': projection['statewide_point']['el_sayed'],
                     'stevens': projection['statewide_point']['stevens'],
                     'mcmorrow': projection['statewide_point']['mcmorrow'],
-                    'total': projection['statewide_point']['total'],
-                    'el_sayed_pct': round(projection['statewide_point']['el_sayed_pct'], 4),
-                    'stevens_pct': round(projection['statewide_point']['stevens_pct'], 4),
-                    'mcmorrow_pct': round(projection['statewide_point']['mcmorrow_pct'], 4),
                     'margin': round(projection['statewide_point']['margin'], 2)
                 },
                 'confidence_intervals': {
@@ -936,10 +883,10 @@ class MichiganSenateModel:
         
         if filename:
             with open(filename, 'w') as f:
-                json.dump(export_data, f, indent=2)
+                json.dump(export_data, f, indent=2, cls=NumpySafeEncoder)
             return filename
         else:
-            return json.dumps(export_data, indent=2)
+            return json.dumps(export_data, indent=2, cls=NumpySafeEncoder)
 
 
 if __name__ == '__main__':
