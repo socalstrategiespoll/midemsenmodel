@@ -124,6 +124,9 @@ def update_model_from_civicapi(mi_model):
 
     updated = []
     for county_name, totals in county_breakdown.items():
+        total_votes = totals["el_sayed"] + totals["stevens"] + totals["mcmorrow"]
+        if total_votes == 0:
+            continue  # civicAPI lists this county with placeholder zeros -- no real votes reported yet
         mi_model.add_results(county_name, totals["el_sayed"], totals["stevens"], totals["mcmorrow"])
         updated.append(county_name)
 
