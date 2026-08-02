@@ -411,15 +411,17 @@ class BayesianShiftEstimator:
         
         # DerSimonian-Laird heterogeneity estimation
         # Compute Q statistic
-        weighted_mean = (df['deviation'] * df['weight']).sum() / df['weight'].sum()
+        weight_sum = df['weight'].sum()
+        weighted_mean = (df['deviation'] * df['weight']).sum() / weight_sum if weight_sum > 0 else df['deviation'].mean()
         Q = (df['weight'] * (df['deviation'] - weighted_mean) ** 2).sum()
         k = len(df)
         W = df['weight'].sum()
         W2 = (df['weight'] ** 2).sum()
         
         # Heterogeneity variance (tau^2)
+        dl_denominator = W - W2 / W if W > 0 else 0
         tau_sq = max(
-            (Q - (k - 1)) / (W - W2 / W) if k > 1 else 0,
+            (Q - (k - 1)) / dl_denominator if k > 1 and dl_denominator > 0 else 0,
             self.config.tau_floor ** 2  # Primary uncertainty buffer
         )
         tau = np.sqrt(tau_sq)
@@ -434,8 +436,9 @@ class BayesianShiftEstimator:
         df['outlier_dampened_weight'] = df['adjusted_weight'] * outlier_factor
         
         # Final weighted mean
-        final_shift = (df['deviation'] * df['outlier_dampened_weight']).sum() / df['outlier_dampened_weight'].sum()
-        se_shift = np.sqrt(1.0 / df['outlier_dampened_weight'].sum())
+        dampened_sum = df['outlier_dampened_weight'].sum()
+        final_shift = (df['deviation'] * df['outlier_dampened_weight']).sum() / dampened_sum if dampened_sum > 0 else 0.0
+        se_shift = np.sqrt(1.0 / dampened_sum) if dampened_sum > 0 else float('inf')
         
         # Credibility interval based on available data
         z_crit = 1.96
@@ -443,7 +446,8 @@ class BayesianShiftEstimator:
         ci_upper = final_shift + z_crit * se_shift
         
         # Effective weight: measure of how much data is driving the estimate
-        effective_weight = df['outlier_dampened_weight'].sum() / df['weight'].max()
+        weight_max = df['weight'].max()
+        effective_weight = dampened_sum / weight_max if weight_max > 0 else 0.0
         
         # Compute regional shifts
         regional_shifts = self._estimate_regional_shifts(df)
@@ -486,14 +490,16 @@ class BayesianShiftEstimator:
             # Mini DerSimonian-Laird for this region
             df = region_data.copy()
             
-            weighted_mean = (df['deviation'] * df['weight']).sum() / df['weight'].sum()
+            weight_sum = df['weight'].sum()
+            weighted_mean = (df['deviation'] * df['weight']).sum() / weight_sum if weight_sum > 0 else df['deviation'].mean()
             Q = (df['weight'] * (df['deviation'] - weighted_mean) ** 2).sum()
             k = len(df)
             W = df['weight'].sum()
             W2 = (df['weight'] ** 2).sum()
             
+            dl_denominator = W - W2 / W if W > 0 else 0
             tau_sq = max(
-                (Q - (k - 1)) / (W - W2 / W) if k > 1 else 0,
+                (Q - (k - 1)) / dl_denominator if k > 1 and dl_denominator > 0 else 0,
                 (self.config.tau_floor / 2) ** 2  # Slightly looser for regional
             )
             tau = np.sqrt(tau_sq)
@@ -505,8 +511,9 @@ class BayesianShiftEstimator:
             outlier_factor = 1.0 / (1.0 + (np.abs(standardized_dev) / self.config.outlier_lambda) ** 2)
             df['outlier_dampened_weight'] = df['adjusted_weight'] * outlier_factor
             
-            regional_shift = (df['deviation'] * df['outlier_dampened_weight']).sum() / df['outlier_dampened_weight'].sum()
-            se_regional = np.sqrt(1.0 / df['outlier_dampened_weight'].sum())
+            dampened_sum = df['outlier_dampened_weight'].sum()
+            regional_shift = (df['deviation'] * df['outlier_dampened_weight']).sum() / dampened_sum if dampened_sum > 0 else 0.0
+            se_regional = np.sqrt(1.0 / dampened_sum) if dampened_sum > 0 else float('inf')
             
             z_crit = 1.96
             ci_lower = regional_shift - z_crit * se_regional
