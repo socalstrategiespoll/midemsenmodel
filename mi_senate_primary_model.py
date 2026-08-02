@@ -308,7 +308,7 @@ class BaselineProjection:
         total_mcmorrow = self.projection['mcmorrow_baseline'].sum()
         total_votes = total_el_sayed + total_stevens + total_mcmorrow
         
-        margin = (total_el_sayed - total_stevens) / (total_el_sayed + total_stevens) * 100
+        margin = (total_el_sayed - total_stevens) / (total_el_sayed + total_stevens) * 100 if (total_el_sayed + total_stevens) > 0 else 0.0
         
         return {
             'el_sayed': total_el_sayed,
@@ -351,7 +351,7 @@ class LiveVoteAggregator:
                 continue
             
             baseline_margin = self.baseline.baselines[county]
-            observed_margin = (votes['el_sayed'] - votes['stevens']) / (votes['el_sayed'] + votes['stevens']) * 100
+            observed_margin = (votes['el_sayed'] - votes['stevens']) / (votes['el_sayed'] + votes['stevens']) * 100 if (votes['el_sayed'] + votes['stevens']) > 0 else 0.0
             deviation = observed_margin - baseline_margin
             pct_reported = votes['total'] / self.baseline.turnout[county]
             
@@ -695,7 +695,7 @@ class StatewideProjector:
         total_mcmorrow = county_projections_df['mcmorrow_projected'].sum()
         total_votes = total_el_sayed + total_stevens + total_mcmorrow
         
-        margin = (total_el_sayed - total_stevens) / (total_el_sayed + total_stevens) * 100
+        margin = (total_el_sayed - total_stevens) / (total_el_sayed + total_stevens) * 100 if (total_el_sayed + total_stevens) > 0 else 0.0
         
         return {
             'el_sayed': total_el_sayed,
@@ -755,7 +755,8 @@ class StatewideProjector:
                 total_el_sayed += simulated_el_sayed
                 total_stevens += simulated_stevens
             
-            margin = (total_el_sayed - total_stevens) / (total_el_sayed + total_stevens) * 100
+            total_votes = total_el_sayed + total_stevens
+            margin = (total_el_sayed - total_stevens) / total_votes * 100 if total_votes > 0 else 0.0
             sim_margins.append(margin)
         
         sim_margins = np.array(sim_margins)
